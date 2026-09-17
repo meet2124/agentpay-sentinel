@@ -1,0 +1,32 @@
+[
+  {
+    "user_id": "usr_basic",
+    "name": "Ananya Patel",
+    "email": "ananya@example.com",
+    "tier": "BASIC",
+    "spending_limit_inr": 1000.0,
+    "daily_limit_inr": 5000.0,
+    "created_at": "2026-01-01T00:00:00",
+    "is_active": true
+  },
+  {
+    "user_id": "usr_standard",
+    "name": "Priya Sharma",
+    "email": "priya@example.com",
+    "tier": "STANDARD",
+    "spending_limit_inr": 10000.0,
+    "daily_limit_inr": 50000.0,
+    "created_at": "2026-01-01T00:00:00",
+    "is_active": true
+  },
+  {
+    "user_id": "usr_premium",
+    "name": "Arjun Singh",
+    "email": "arjun@example.com",
+    "tier": "PREMIUM",
+    "spending_limit_inr": 50000.0,
+    "daily_limit_inr": 200000.0,
+    "created_at": "2026-01-01T00:00:00",
+    "is_active": true
+  }
+]

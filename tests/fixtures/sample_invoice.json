@@ -1,0 +1,18 @@
+{
+  "vendor_name": "ABC Hardware Co.",
+  "vendor_gstin": "29AABCU9603R1ZX",
+  "amount": 1850.00,
+  "currency": "INR",
+  "invoice_number": "INV-042",
+  "invoice_date": "2026-09-15",
+  "line_items": [
+    {
+      "description": "Electrical fittings - Type A",
+      "quantity": 5,
+      "unit_price": 370.00,
+      "total": 1850.00
+    }
+  ],
+  "extraction_confidence": 0.94,
+  "extraction_method": "STUB"
+}
