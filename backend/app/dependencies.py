@@ -2,19 +2,31 @@
 AgentPay Sentinel — Dependency Injection Container
 
 Provides FastAPI dependency functions that wire together adapters and services.
-Switching from local to AWS adapters requires changing only this file.
+
+Adapter selection:
+  USE_LOCAL_ADAPTERS=True  → local in-memory implementations (default, no AWS needed)
+  USE_LOCAL_ADAPTERS=False → AWS implementations (S3, DynamoDB)
+
+Switching adapters requires changing only this file.
+Service code (policy_service, comparison_service, etc.) is never touched.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+from .adapters.base import (
+    AuditStoreAdapter,
+    EvidenceStoreAdapter,
+    SessionStoreAdapter,
+    StorageAdapter,
+)
 from .adapters.local import (
     LocalAuditStoreAdapter,
+    LocalEvidenceStoreAdapter,
     LocalLLMAdapter,
     LocalSessionStoreAdapter,
     LocalStorageAdapter,
@@ -32,13 +44,57 @@ from .services.policy_service import PolicyService
 
 
 # ---------------------------------------------------------------------------
-# Adapter singletons (module-level — shared across requests)
+# Adapter singletons — selected once at startup based on USE_LOCAL_ADAPTERS
 # ---------------------------------------------------------------------------
 
-_session_store = LocalSessionStoreAdapter()
-_storage       = LocalStorageAdapter()
-_llm           = LocalLLMAdapter()
-_audit_store   = LocalAuditStoreAdapter()
+def _build_adapters(settings: Settings) -> tuple[
+    SessionStoreAdapter,
+    StorageAdapter,
+    LocalLLMAdapter,      # LLM: always local until Bedrock phase
+    AuditStoreAdapter,
+    EvidenceStoreAdapter,
+]:
+    """
+    Instantiate the correct set of adapters based on configuration.
+
+    Local mode: in-memory stubs — no AWS credentials required.
+    AWS mode:   boto3-backed adapters — requires IAM role or credentials.
+    """
+    if settings.USE_LOCAL_ADAPTERS:
+        return (
+            LocalSessionStoreAdapter(),
+            LocalStorageAdapter(),
+            LocalLLMAdapter(),
+            LocalAuditStoreAdapter(),
+            LocalEvidenceStoreAdapter(),
+        )
+
+    # AWS mode — import lazily to avoid boto3 initialisation in local/test contexts
+    from .adapters.s3 import S3StorageAdapter
+    from .adapters.dynamo import (
+        DynamoAuditStoreAdapter,
+        DynamoEvidenceStoreAdapter,
+        DynamoSessionStoreAdapter,
+    )
+    from .adapters.bedrock import BedrockAdapter
+
+    return (
+        DynamoSessionStoreAdapter(settings),
+        S3StorageAdapter(settings),
+        BedrockAdapter(settings),           # Real intent + evidence extraction via Claude
+        DynamoAuditStoreAdapter(settings),
+        DynamoEvidenceStoreAdapter(settings),
+    )
+
+
+_settings = get_settings()
+(
+    _session_store,
+    _storage,
+    _llm,
+    _audit_store,
+    _evidence_store,
+) = _build_adapters(_settings)
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +103,11 @@ _audit_store   = LocalAuditStoreAdapter()
 
 _auth_service       = AuthService(session_store=_session_store)
 _intent_service     = IntentService(llm_adapter=_llm)
-_evidence_service   = EvidenceService(storage_adapter=_storage, llm_adapter=_llm)
+_evidence_service   = EvidenceService(
+    storage_adapter=_storage,
+    llm_adapter=_llm,
+    evidence_store=_evidence_store,
+)
 _comparison_service = ComparisonService()
 _policy_service     = PolicyService()
 _audit_service      = AuditService(audit_store=_audit_store)
@@ -87,8 +147,9 @@ def get_policy_service() -> PolicyService:
     return _policy_service
 
 
-def get_session_store() -> LocalSessionStoreAdapter:
-    return _session_store  # type: ignore[return-value]
+def get_session_store() -> SessionStoreAdapter:
+    """Return the active session store adapter (local or DynamoDB)."""
+    return _session_store
 
 
 # ---------------------------------------------------------------------------

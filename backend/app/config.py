@@ -45,7 +45,15 @@ class Settings(BaseSettings):
     S3_BUCKET_NAME: Optional[str] = None
     DYNAMODB_TABLE_AUDIT: Optional[str] = None
     DYNAMODB_TABLE_SESSIONS: Optional[str] = None
-    BEDROCK_MODEL_ID: str = "anthropic.claude-3-sonnet-20240229-v1:0"
+    # Evidence metadata is stored in sentinel-sessions with EVIDENCE# key prefix
+    # (2-table design). This variable is kept for future table-split flexibility.
+    DYNAMODB_TABLE_EVIDENCE: Optional[str] = None
+    BEDROCK_MODEL_ID: str = "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+    # --- Lambda / API Gateway ---
+    # Set to the API Gateway stage name (e.g. "prod") when running on Lambda.
+    # Used by mangum to strip the stage prefix from request paths.
+    LAMBDA_STAGE: str = "local"
 
     # --- Session ---
     SESSION_TTL_SECONDS: int = 3600             # 1 hour

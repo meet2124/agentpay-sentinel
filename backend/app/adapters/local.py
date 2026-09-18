@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .base import AuditStoreAdapter, LLMAdapter, SessionStoreAdapter, StorageAdapter
+from .base import AuditStoreAdapter, EvidenceStoreAdapter, LLMAdapter, SessionStoreAdapter, StorageAdapter
 from ..utils.crypto import GENESIS_HASH
 
 
@@ -75,6 +75,7 @@ _session_store: dict[str, dict] = {}   # token → session dict
 _payee_history: dict[str, list[str]] = {}  # user_id → [payee names]
 _audit_store: dict[str, dict] = {}     # event_id → event dict
 _audit_order: dict[str, list[str]] = {}  # user_id → [event_ids in order]
+_evidence_store: dict[str, dict] = {}  # evidence_id → serialised Evidence dict
 
 
 # ---------------------------------------------------------------------------
@@ -194,10 +195,32 @@ class LocalAuditStoreAdapter(AuditStoreAdapter):
 
 
 # ---------------------------------------------------------------------------
+# Evidence Store Adapter — Local
+# ---------------------------------------------------------------------------
+
+class LocalEvidenceStoreAdapter(EvidenceStoreAdapter):
+    """
+    In-memory evidence metadata store using a module-level dict.
+
+    Mirrors the behaviour of EvidenceService._evidence_store before it was
+    extracted into an adapter. Process-lifetime only — replaced by
+    DynamoEvidenceStoreAdapter in AWS mode.
+    """
+
+    async def put_evidence(self, evidence_dict: dict) -> None:
+        evidence_id = evidence_dict["evidence_id"]
+        _evidence_store[evidence_id] = copy.deepcopy(evidence_dict)
+
+    async def get_evidence(self, evidence_id: str) -> dict | None:
+        ev = _evidence_store.get(evidence_id)
+        return copy.deepcopy(ev) if ev else None
+
+
+# ---------------------------------------------------------------------------
 # LLM Adapter — Stub (deterministic fixtures for local dev)
 # ---------------------------------------------------------------------------
 # The stub parses common patterns from the raw_input string so that tests
-# can exercise meaningful data without a real LLM.  Bedrock replaces this on Day 2.
+# can exercise meaningful data without a real LLM.  Bedrock replaces this on Phase 3.2.
 # ---------------------------------------------------------------------------
 
 _AMOUNT_RE = re.compile(r"[₹Rs\.]*\s*([\d,]+(?:\.\d{1,2})?)", re.IGNORECASE)

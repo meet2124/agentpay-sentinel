@@ -14,7 +14,7 @@ from typing import Optional
 
 from fastapi import HTTPException, UploadFile, status
 
-from ..adapters.base import LLMAdapter, StorageAdapter
+from ..adapters.base import EvidenceStoreAdapter, LLMAdapter, StorageAdapter
 from ..config import get_settings
 from ..models.evidence import Evidence, EvidenceItem, EvidenceSourceType, ExtractionMethod
 
@@ -41,13 +41,12 @@ class EvidenceService:
         self,
         storage_adapter: StorageAdapter,
         llm_adapter: LLMAdapter,
+        evidence_store: EvidenceStoreAdapter,
     ) -> None:
         self._storage = storage_adapter
         self._llm = llm_adapter
+        self._evidence_store = evidence_store   # injected — local dict or DynamoDB
         self._settings = get_settings()
-
-        # In-process store: evidence_id → Evidence (replaced by DynamoDB on Day 2)
-        self._evidence_store: dict[str, Evidence] = {}
 
     async def upload_and_extract(
         self,
@@ -75,7 +74,7 @@ class EvidenceService:
 
         evidence_id = f"evid_{uuid.uuid4().hex[:12]}"
 
-        # Store file
+        # Store file bytes
         storage_key = await self._storage.store_file(
             user_id=user_id,
             file_id=evidence_id,
@@ -98,11 +97,18 @@ class EvidenceService:
             content_type=content_type,
         )
 
-        self._evidence_store[evidence_id] = evidence
+        # Persist evidence metadata via adapter (local dict or DynamoDB)
+        await self._evidence_store.put_evidence(evidence.model_dump(mode="json"))
         return evidence
 
     async def get_evidence(self, evidence_id: str) -> Optional[Evidence]:
-        return self._evidence_store.get(evidence_id)
+        evidence_dict = await self._evidence_store.get_evidence(evidence_id)
+        if evidence_dict is None:
+            return None
+        try:
+            return Evidence.model_validate(evidence_dict)
+        except Exception:
+            return None
 
     def _build_evidence(
         self,

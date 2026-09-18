@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  AgentPay Sentinel — Evidence-Aware Trust Gateway for AI-Initiated Actions.
+  Phase 3.1: API Gateway + Lambda + S3 + DynamoDB + CloudWatch.
+  Region: ap-south-1.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [local, staging, production]
+    Description: Runtime environment label
+
+  ApiKeySalt:
+    Type: String
+    NoEcho: true
+    Default: "sentinel-prod-salt-CHANGE-ME"
+    Description: >
+      Salt for API key hashing. Override with a secure random value.
+      Stored as a Lambda environment variable (not in source code).
+
+  AllowedOrigins:
+    Type: String
+    Default: "http://localhost:5173"
+    Description: >
+      Comma-separated list of allowed CORS origins.
+      Update to your frontend URL after deployment.
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        # AWS_REGION is set automatically by the Lambda runtime (reserved variable).
+        # It equals the region this function is deployed in — no override needed.
+        USE_LOCAL_ADAPTERS: "False"
+        S3_BUCKET_NAME: !Ref EvidenceBucket
+        DYNAMODB_TABLE_AUDIT: !Ref AuditTable
+        DYNAMODB_TABLE_SESSIONS: !Ref SessionsTable
+        SESSION_TTL_SECONDS: "3600"
+        ALLOWED_ORIGINS: !Ref AllowedOrigins
+        API_KEY_SALT: !Ref ApiKeySalt
+        LAMBDA_STAGE: "prod"
+        # APAC cross-region inference profile — required for ap-south-1.
+        # Direct model ID (without apac. prefix) raises ValidationException here.
+        BEDROCK_MODEL_ID: "apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # ── API Gateway (HTTP API — lower cost than REST API) ───────────────────
+  SentinelApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Description: AgentPay Sentinel — Trust Gateway API
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"            # Refined via ALLOWED_ORIGINS env var in FastAPI
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+          - X-Requested-With
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        MaxAge: 600
+      # Access logging to CloudWatch
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "responseLength":"$context.responseLength",
+          "integrationLatency":"$context.integrationLatency"}
+      Tags:
+        Project: AgentPaySentinel
+        Phase: "3.1"
+
+  # ── Lambda Function ──────────────────────────────────────────────────────
+  SentinelFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "sentinel-trust-gateway-${Environment}"
+      Description: >
+        AgentPay Sentinel Trust Gateway. Wraps FastAPI with Mangum.
+        Single function — all services run in-process (not one Lambda per endpoint).
+      CodeUri: backend/
+      Handler: lambda_handler.handler
+      Role: !GetAtt SentinelFunctionRole.Arn
+      # Events: all HTTP methods proxied through API Gateway
+      Events:
+        ApiCatchAll:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SentinelApi
+            Method: ANY
+            Path: /{proxy+}
+        ApiRoot:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SentinelApi
+            Method: ANY
+            Path: /
+      # Lambda logs to CloudWatch
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+      Tags:
+        Project: AgentPaySentinel
+        Phase: "3.1"
+
+  # ── Lambda Execution Role ────────────────────────────────────────────────
+  SentinelFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "sentinel-lambda-role-${Environment}"
+      Description: >
+        Least-privilege execution role for the Sentinel Lambda function.
+        Only the permissions actually required for Phase 3.1 runtime.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        # CloudWatch Logs — required for Lambda logging
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt FunctionLogGroup.Arn
+                  - !Sub "${FunctionLogGroup.Arn}:*"
+
+        # S3 — GetObject + PutObject on evidence/ prefix only
+        - PolicyName: S3EvidenceAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${EvidenceBucket}/evidence/*"
+
+        # DynamoDB — GetItem + PutItem + Query on sentinel-audit
+        - PolicyName: DynamoDBAuditAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt AuditTable.Arn
+                  - !Sub "${AuditTable.Arn}/index/*"
+
+        # DynamoDB — GetItem + PutItem + Query on sentinel-sessions
+        - PolicyName: DynamoDBSessionsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt SessionsTable.Arn
+                  - !Sub "${SessionsTable.Arn}/index/*"
+
+        # Bedrock — Converse API (IAM action: bedrock:InvokeModel)
+        # The Lambda calls Converse with modelId set to the APAC cross-region
+        # inference profile: apac.anthropic.claude-3-5-sonnet-20241022-v2:0
+        #
+        # AWS evaluates the request against BOTH resources:
+        #   1. The inference profile ARN (account-scoped, deployment region)
+        #      — required because the modelId IS the inference profile resource.
+        #   2. The foundation model ARN (wildcard region)
+        #      — required because the profile routes traffic to destination regions
+        #        (ap-northeast-1, us-east-1, us-west-2); the wildcard permits routing.
+        # Omitting either ARN produces AccessDenied at runtime.
+        - PolicyName: BedrockConverseAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/apac.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0"
+
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+
+  # ── S3 — Evidence Bucket ─────────────────────────────────────────────────
+  EvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "sentinel-evidence-${AWS::AccountId}-${AWS::Region}"
+      # Block all public access — evidence files are private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Server-side encryption with S3-managed keys
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Versioning — enables recovery of overwritten or deleted evidence files
+      VersioningConfiguration:
+        Status: Enabled
+      # Lifecycle: move older versions to cheaper storage after 90 days
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+            NoncurrentVersionExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+        - Key: DataClassification
+          Value: Confidential
+
+  # Explicit bucket policy denying non-HTTPS access
+  EvidenceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EvidenceBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt EvidenceBucket.Arn
+              - !Sub "${EvidenceBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ── DynamoDB — Audit Events Table ────────────────────────────────────────
+  AuditTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sentinel-audit
+      BillingMode: PAY_PER_REQUEST          # No capacity planning for hackathon
+      TableClass: STANDARD
+      # Primary key: user_id (PK) + ts_event_id (SK)
+      # SK format: "{iso_timestamp}#{event_id}" — sorts chronologically
+      AttributeDefinitions:
+        - AttributeName: pk              # user_id
+          AttributeType: S
+        - AttributeName: ts_event_id    # "{timestamp}#{event_id}"
+          AttributeType: S
+        - AttributeName: event_id       # for GSI single-event lookup
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: ts_event_id
+          KeyType: RANGE
+      # GSI: look up a single event by event_id (used by GET /audit/events/{id})
+      GlobalSecondaryIndexes:
+        - IndexName: event_id-index
+          KeySchema:
+            - AttributeName: event_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      # Point-in-time recovery — audit trail must be recoverable
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+        - Key: DataClassification
+          Value: SecuritySensitive
+
+  # ── DynamoDB — Sessions / State Table ────────────────────────────────────
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: sentinel-sessions
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      # Native TTL — DynamoDB automatically deletes expired sessions
+      TimeToLiveSpecification:
+        AttributeName: expires_at_epoch
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+
+  # ── CloudWatch Log Groups ────────────────────────────────────────────────
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/sentinel-trust-gateway-${Environment}"
+      RetentionInDays: 30               # 30 days — balances cost vs. observability
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/sentinel-api-${Environment}"
+      RetentionInDays: 14
+      Tags:
+        - Key: Project
+          Value: AgentPaySentinel
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: >
+      API Gateway base URL. Set this as VITE_API_BASE_URL in frontend/.env
+      to point the frontend at the deployed backend.
+    Value: !Sub "https://${SentinelApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiBaseUrl"
+
+  EvidenceBucketName:
+    Description: Name of the private S3 evidence bucket
+    Value: !Ref EvidenceBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EvidenceBucket"
+
+  AuditTableName:
+    Description: Name of the DynamoDB audit events table
+    Value: !Ref AuditTable
+    Export:
+      Name: !Sub "${AWS::StackName}-AuditTable"
+
+  SessionsTableName:
+    Description: Name of the DynamoDB sessions/state table
+    Value: !Ref SessionsTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SessionsTable"
+
+  LambdaFunctionArn:
+    Description: ARN of the Sentinel Lambda function
+    Value: !GetAtt SentinelFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionArn"

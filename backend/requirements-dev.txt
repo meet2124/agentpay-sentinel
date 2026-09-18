@@ -1,0 +1,13 @@
+# AgentPay Sentinel — Development / Test Dependencies
+# These are NOT included in the Lambda deployment package.
+# Install with: pip install -r requirements.txt -r requirements-dev.txt
+
+# Testing framework
+pytest==8.3.3
+pytest-asyncio==0.24.0
+httpx==0.27.2
+
+# AWS mock library — allows testing S3 + DynamoDB adapters without live AWS.
+# Strictly dev/test only. Never import moto in application code.
+# moto creates a full in-process mock of the AWS APIs, so tests run offline.
+moto[s3,dynamodb]==5.2.3

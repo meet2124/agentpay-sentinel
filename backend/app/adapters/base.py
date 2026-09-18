@@ -3,9 +3,9 @@ AgentPay Sentinel — Adapters: Abstract Base Classes
 
 Each adapter defines the interface. Implementations:
   local.py  — in-memory stubs for Day 1 local development
-  s3.py     — AWS S3 (Day 2)
-  dynamo.py — AWS DynamoDB (Day 2)
-  bedrock.py — AWS Bedrock (Day 2)
+  s3.py     — AWS S3 (Phase 3.1)
+  dynamo.py — AWS DynamoDB (Phase 3.1)
+  bedrock.py — AWS Bedrock (Phase 3.2)
 
 Business logic services depend only on these interfaces,
 making AWS swap-in require zero changes to service code.
@@ -90,6 +90,25 @@ class AuditStoreAdapter(ABC):
     @abstractmethod
     async def get_last_event_hash(self, user_id: str) -> str:
         """Return the event_hash of the most recent event for this user, or GENESIS."""
+
+
+class EvidenceStoreAdapter(ABC):
+    """
+    Abstract store for parsed Evidence metadata.
+
+    The raw file bytes are handled separately by StorageAdapter (S3 or local dict).
+    This adapter stores only the structured Evidence object (as a dict) so that
+    evidence can be retrieved by ID across Lambda invocations (AWS mode) or
+    within the same process (local mode).
+    """
+
+    @abstractmethod
+    async def put_evidence(self, evidence_dict: dict[str, Any]) -> None:
+        """Persist a serialised Evidence dict, keyed by evidence_id."""
+
+    @abstractmethod
+    async def get_evidence(self, evidence_id: str) -> Optional[dict[str, Any]]:
+        """Return a serialised Evidence dict by evidence_id, or None if not found."""
 
 
 class LLMAdapter(ABC):

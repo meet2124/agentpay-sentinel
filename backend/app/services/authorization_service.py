@@ -18,6 +18,7 @@ Raw LLM text never reaches step 6 (policy evaluation).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -34,6 +35,8 @@ from .evidence_service import EvidenceService
 from .intent_service import IntentService
 from .payment_simulator import PaymentSimulator
 from .policy_service import PolicyService
+
+logger = logging.getLogger(__name__)
 
 
 class AuthorizationService:
@@ -109,6 +112,34 @@ class AuthorizationService:
         decision_id = f"dec_{uuid.uuid4().hex[:12]}"
         decided_at = datetime.now(timezone.utc)
         expires_at = decided_at + timedelta(hours=1)
+
+        # Structured decision log — no PII, no exact amounts
+        # Amount is bucketed for CloudWatch metrics without exposing exact values
+        _amount = intent.amount
+        if _amount <= 500:
+            amount_band = "0-500"
+        elif _amount <= 1000:
+            amount_band = "501-1000"
+        elif _amount <= 5000:
+            amount_band = "1001-5000"
+        elif _amount <= 10000:
+            amount_band = "5001-10000"
+        else:
+            amount_band = "10001+"
+
+        logger.info(
+            "authorization_decision",
+            extra={
+                "event": "authorization_decision",
+                "user_id_prefix": user.user_id[:8],   # partial ID only
+                "decision": decision.value,
+                "matched_rule": policy_result.matched_rule_ids[0] if policy_result.matched_rule_ids else "none",
+                "amount_band_inr": amount_band,
+                "evidence_present": signals.evidence_present,
+                "payee_seen_before": signals.payee_seen_before,
+                "decision_id": decision_id,
+            },
+        )
 
         # Step 6: Execute mock payment ONLY if ALLOW
         payment_result: Optional[MockPaymentResult] = None
