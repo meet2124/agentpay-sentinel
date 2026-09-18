@@ -13,6 +13,7 @@ Service code (policy_service, comparison_service, etc.) is never touched.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import Annotated
 
 from fastapi import Depends, HTTPException, Security, status
@@ -21,6 +22,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .adapters.base import (
     AuditStoreAdapter,
     EvidenceStoreAdapter,
+    PendingDecisionStoreAdapter,
     SessionStoreAdapter,
     StorageAdapter,
 )
@@ -28,6 +30,7 @@ from .adapters.local import (
     LocalAuditStoreAdapter,
     LocalEvidenceStoreAdapter,
     LocalLLMAdapter,
+    LocalPendingDecisionStoreAdapter,
     LocalSessionStoreAdapter,
     LocalStorageAdapter,
 )
@@ -40,7 +43,24 @@ from .services.comparison_service import ComparisonService
 from .services.evidence_service import EvidenceService
 from .services.intent_service import IntentService
 from .services.payment_simulator import PaymentSimulator
+from .services.pending_decision_service import PendingDecisionService
 from .services.policy_service import PolicyService
+
+
+# ---------------------------------------------------------------------------
+# Session context — returned by get_current_session_context
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class SessionContext:
+    """
+    Carries the authenticated User and their real session_id together.
+
+    Used by the /payments/evaluate endpoint to replace the previously
+    hardcoded session_id="sess_api" with the real authenticated session.
+    """
+    user: User
+    session_id: str
 
 
 # ---------------------------------------------------------------------------
@@ -53,6 +73,7 @@ def _build_adapters(settings: Settings) -> tuple[
     LocalLLMAdapter,      # LLM: always local until Bedrock phase
     AuditStoreAdapter,
     EvidenceStoreAdapter,
+    PendingDecisionStoreAdapter,
 ]:
     """
     Instantiate the correct set of adapters based on configuration.
@@ -67,6 +88,7 @@ def _build_adapters(settings: Settings) -> tuple[
             LocalLLMAdapter(),
             LocalAuditStoreAdapter(),
             LocalEvidenceStoreAdapter(),
+            LocalPendingDecisionStoreAdapter(),
         )
 
     # AWS mode — import lazily to avoid boto3 initialisation in local/test contexts
@@ -74,6 +96,7 @@ def _build_adapters(settings: Settings) -> tuple[
     from .adapters.dynamo import (
         DynamoAuditStoreAdapter,
         DynamoEvidenceStoreAdapter,
+        DynamoPendingDecisionStoreAdapter,
         DynamoSessionStoreAdapter,
     )
     from .adapters.bedrock import BedrockAdapter
@@ -84,6 +107,7 @@ def _build_adapters(settings: Settings) -> tuple[
         BedrockAdapter(settings),           # Real intent + evidence extraction via Claude
         DynamoAuditStoreAdapter(settings),
         DynamoEvidenceStoreAdapter(settings),
+        DynamoPendingDecisionStoreAdapter(settings),
     )
 
 
@@ -94,6 +118,7 @@ _settings = get_settings()
     _llm,
     _audit_store,
     _evidence_store,
+    _pending_store,
 ) = _build_adapters(_settings)
 
 
@@ -112,6 +137,7 @@ _comparison_service = ComparisonService()
 _policy_service     = PolicyService()
 _audit_service      = AuditService(audit_store=_audit_store)
 _payment_simulator  = PaymentSimulator()
+_pending_decision_service = PendingDecisionService(store=_pending_store)
 _authorization_service = AuthorizationService(
     intent_service=_intent_service,
     evidence_service=_evidence_service,
@@ -120,6 +146,7 @@ _authorization_service = AuthorizationService(
     audit_service=_audit_service,
     payment_simulator=_payment_simulator,
     session_store=_session_store,
+    pending_decision_svc=_pending_decision_service,
 )
 
 
@@ -152,6 +179,11 @@ def get_session_store() -> SessionStoreAdapter:
     return _session_store
 
 
+def get_pending_decision_service() -> PendingDecisionService:
+    """Return the pending decision service singleton."""
+    return _pending_decision_service
+
+
 # ---------------------------------------------------------------------------
 # Auth dependency — extracts and validates Bearer token
 # ---------------------------------------------------------------------------
@@ -173,3 +205,28 @@ async def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return await auth_svc.validate_token(credentials.credentials)
+
+
+async def get_current_session_context(
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Security(_bearer)
+    ] = None,
+    auth_svc: AuthService = Depends(get_auth_service),
+) -> SessionContext:
+    """
+    FastAPI dependency: validate Bearer token → return SessionContext(user, session_id).
+
+    Used by the /payments/evaluate endpoint to pass the REAL authenticated
+    session_id into the authorization pipeline, replacing the previously
+    hardcoded 'sess_api'.
+
+    Does NOT weaken authentication — same token validation as get_current_user.
+    """
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization header required (Bearer token).",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    user, session_id = await auth_svc.validate_token_with_session(credentials.credentials)
+    return SessionContext(user=user, session_id=session_id)

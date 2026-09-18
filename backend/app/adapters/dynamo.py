@@ -19,14 +19,18 @@ Implements three adapters over two DynamoDB tables (2-table approved design):
     SESSION#{token}       / SESSION#{token}         → session dict + TTL
     PAYEE#{user_id}       / PAYEE#{payee_name}      → {} (existence = seen)
     EVIDENCE#{evidence_id}/ EVIDENCE#{evidence_id}  → Evidence JSON
+    PENDING#{decision_id} / PENDING#{decision_id}   → PendingDecision JSON
 
 Security:
   - Table names come from config — never hardcoded in business logic
-  - IAM role grants GetItem, PutItem, Query on these tables only
-  - No DeleteItem/Scan/UpdateItem — not required for this design
-  - Audit events are append-only (no update/delete path)
+  - IAM role grants GetItem, PutItem, Query, UpdateItem on these tables only
+  - Audit events are append-only (no update/delete path in the audit table)
   - Audit chain integrity computed in Python, not relied on DynamoDB ordering
+  - UpdateItem is used exclusively for atomic conditional status transitions
+    on pending decisions (PENDING→APPROVED/DENIED and APPROVED→EXECUTED).
+    Both transitions use ConditionExpression to prevent concurrent replay.
 """
+
 
 from __future__ import annotations
 
@@ -41,7 +45,7 @@ import boto3
 from boto3.dynamodb.conditions import Key
 from botocore.exceptions import ClientError
 
-from .base import AuditStoreAdapter, EvidenceStoreAdapter, SessionStoreAdapter
+from .base import AuditStoreAdapter, EvidenceStoreAdapter, PendingDecisionStoreAdapter, SessionStoreAdapter
 from ..utils.crypto import GENESIS_HASH
 
 if TYPE_CHECKING:
@@ -530,3 +534,246 @@ class DynamoEvidenceStoreAdapter(EvidenceStoreAdapter):
 
     async def get_evidence(self, evidence_id: str) -> Optional[dict[str, Any]]:
         return self._sessions_adapter._get_evidence(evidence_id)
+
+
+# ---------------------------------------------------------------------------
+# Pending Decision Store — sentinel-sessions table (PENDING# prefix)
+# ---------------------------------------------------------------------------
+
+class DynamoPendingDecisionStoreAdapter(PendingDecisionStoreAdapter):
+    """
+    DynamoDB-backed store for pending human-approval decisions.
+
+    Uses the sentinel-sessions table (2-table design) with key prefix:
+      pk = PENDING#{decision_id}
+      sk = PENDING#{decision_id}
+
+    This is consistent with the existing prefix conventions:
+      USER#, APIKEY#, SESSION#, PAYEE#, EVIDENCE#, PENDING#
+
+    TTL: expires_at_epoch is set so DynamoDB native TTL automatically
+    purges expired decisions (same mechanism as sessions).
+
+    REPLAY PROTECTION: update_pending_decision uses a ConditionExpression
+    (attribute_exists(pk) AND #st = :pending) to atomically verify the
+    decision is still PENDING before transitioning. Concurrent approvals
+    will cause a ConditionalCheckFailedException, raising RuntimeError.
+    """
+
+    def __init__(self, settings: "Settings") -> None:
+        if not settings.DYNAMODB_TABLE_SESSIONS:
+            raise ValueError(
+                "DYNAMODB_TABLE_SESSIONS must be set when USE_LOCAL_ADAPTERS=False."
+            )
+        self._table_name = settings.DYNAMODB_TABLE_SESSIONS
+        _dynamodb = boto3.resource("dynamodb", region_name=settings.AWS_REGION)
+        self._table = _dynamodb.Table(self._table_name)
+        self._client = boto3.client("dynamodb", region_name=settings.AWS_REGION)
+        logger.info(
+            "DynamoPendingDecisionStoreAdapter initialised",
+            extra={"table": self._table_name},
+        )
+
+    def _pk(self, decision_id: str) -> str:
+        return f"PENDING#{decision_id}"
+
+    async def put_pending_decision(self, record: dict[str, Any]) -> None:
+        """
+        Persist a new pending decision record.
+        Sets expires_at_epoch for DynamoDB native TTL.
+        """
+        decision_id = record["decision_id"]
+        pk = self._pk(decision_id)
+
+        # Compute epoch for DynamoDB TTL (same pattern as sessions)
+        expires_at_str = record.get("expires_at")
+        expires_epoch: Optional[int] = None
+        if expires_at_str:
+            try:
+                expires_dt = datetime.fromisoformat(str(expires_at_str))
+                if expires_dt.tzinfo is None:
+                    expires_dt = expires_dt.replace(tzinfo=timezone.utc)
+                expires_epoch = int(expires_dt.timestamp())
+            except (ValueError, TypeError):
+                pass
+
+        item: dict[str, Any] = {
+            "pk": pk,
+            "sk": pk,
+            **record,
+        }
+        if expires_epoch is not None:
+            item["expires_at_epoch"] = expires_epoch
+
+        try:
+            self._table.put_item(Item=_to_dynamo(item))
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            logger.error(
+                "DynamoDB PutItem (pending decision) failed",
+                extra={"decision_id": decision_id, "error_code": error_code},
+            )
+            raise RuntimeError(
+                f"Failed to persist pending decision {decision_id}: {error_code}"
+            ) from exc
+
+        logger.info(
+            "Pending decision persisted",
+            extra={"decision_id": decision_id},
+        )
+
+    async def get_pending_decision(self, decision_id: str) -> Optional[dict[str, Any]]:
+        """Retrieve a pending decision record by decision_id."""
+        pk = self._pk(decision_id)
+        try:
+            response = self._table.get_item(Key={"pk": pk, "sk": pk})
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            logger.error(
+                "DynamoDB GetItem (pending decision) failed",
+                extra={"decision_id": decision_id, "error_code": error_code},
+            )
+            raise RuntimeError(
+                f"DynamoDB GetItem failed for pending decision {decision_id}: {error_code}"
+            ) from exc
+
+        item = response.get("Item")
+        if not item:
+            return None
+        converted = _from_dynamo(item)
+        return {k: v for k, v in converted.items() if k not in {"pk", "sk", "expires_at_epoch"}}
+
+    async def update_pending_decision(
+        self, decision_id: str, updates: dict[str, Any]
+    ) -> None:
+        """
+        Atomically transition a pending decision's status.
+
+        REPLAY PROTECTION: ConditionExpression enforces that status must be
+        PENDING at the time of the write. Concurrent/replayed approvals
+        raise RuntimeError (mapped from ConditionalCheckFailedException).
+        """
+        pk = self._pk(decision_id)
+
+        # Build SET expression from updates dict
+        set_clauses = []
+        expr_names: dict[str, str] = {"#st": "status"}
+        expr_values: dict[str, Any] = {":pending": {"S": "PENDING"}}
+
+        for i, (key, val) in enumerate(updates.items()):
+            placeholder_name  = f"#f{i}"
+            placeholder_value = f":v{i}"
+            expr_names[placeholder_name] = key
+            # Convert Python types to DynamoDB attribute values
+            if isinstance(val, str):
+                expr_values[placeholder_value] = {"S": val}
+            elif isinstance(val, bool):
+                expr_values[placeholder_value] = {"BOOL": val}
+            elif isinstance(val, (int, float)):
+                expr_values[placeholder_value] = {"N": str(val)}
+            elif val is None:
+                # Skip None values — use REMOVE instead
+                continue
+            else:
+                expr_values[placeholder_value] = {"S": str(val)}
+            set_clauses.append(f"{placeholder_name} = {placeholder_value}")
+
+        if not set_clauses:
+            return  # Nothing to update
+
+        update_expression = "SET " + ", ".join(set_clauses)
+        # Condition: record must exist AND status must still be PENDING
+        condition_expression = "attribute_exists(pk) AND #st = :pending"
+
+        try:
+            self._client.update_item(
+                TableName=self._table_name,
+                Key={
+                    "pk": {"S": pk},
+                    "sk": {"S": pk},
+                },
+                UpdateExpression=update_expression,
+                ConditionExpression=condition_expression,
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+            )
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code == "ConditionalCheckFailedException":
+                logger.warning(
+                    "Pending decision conditional update rejected "
+                    "(not PENDING or not found — replay attempt?)",
+                    extra={"decision_id": decision_id},
+                )
+                raise RuntimeError(
+                    f"Pending decision {decision_id} is no longer PENDING or does not exist. "
+                    "Approval replay rejected."
+                ) from exc
+            logger.error(
+                "DynamoDB UpdateItem (pending decision) failed",
+                extra={"decision_id": decision_id, "error_code": error_code},
+            )
+            raise RuntimeError(
+                f"Failed to update pending decision {decision_id}: {error_code}"
+            ) from exc
+
+        logger.info(
+            "Pending decision updated",
+            extra={"decision_id": decision_id, "new_status": updates.get("status")},
+        )
+
+    async def mark_executed(self, decision_id: str, executed_at: str) -> None:
+        """
+        Atomically transition an APPROVED decision to EXECUTED.
+
+        Uses a DynamoDB UpdateItem with ConditionExpression (#st = :approved) so
+        that a concurrent call receives ConditionalCheckFailedException and cannot
+        transition the same decision to EXECUTED twice.
+
+        Raises RuntimeError on condition failure (concurrent execution attempt)
+        or other DynamoDB errors.
+        """
+        pk = self._pk(decision_id)
+        try:
+            self._client.update_item(
+                TableName=self._table_name,
+                Key={
+                    "pk": {"S": pk},
+                    "sk": {"S": pk},
+                },
+                UpdateExpression="SET #st = :executed, #ea = :executed_at",
+                ConditionExpression="attribute_exists(pk) AND #st = :approved",
+                ExpressionAttributeNames={
+                    "#st": "status",
+                    "#ea": "executed_at",
+                },
+                ExpressionAttributeValues={
+                    ":executed":    {"S": "EXECUTED"},
+                    ":executed_at": {"S": executed_at},
+                    ":approved":    {"S": "APPROVED"},
+                },
+            )
+        except ClientError as exc:
+            error_code = exc.response["Error"]["Code"]
+            if error_code == "ConditionalCheckFailedException":
+                logger.warning(
+                    "mark_executed conditional update rejected "
+                    "(not APPROVED or not found — concurrent execution attempt?)",
+                    extra={"decision_id": decision_id},
+                )
+                raise RuntimeError(
+                    f"Pending decision {decision_id} is not APPROVED or does not exist. "
+                    "Cannot mark as EXECUTED — concurrent execution guard rejected."
+                ) from exc
+            logger.error(
+                "DynamoDB UpdateItem (mark_executed) failed",
+                extra={"decision_id": decision_id, "error_code": error_code},
+            )
+            raise RuntimeError(
+                f"Failed to mark pending decision {decision_id} as EXECUTED: {error_code}"
+            ) from exc
+
+        logger.info(
+            "Pending decision marked EXECUTED",
+            extra={"decision_id": decision_id},
+        )

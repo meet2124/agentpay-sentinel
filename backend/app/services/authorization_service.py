@@ -34,6 +34,7 @@ from .comparison_service import ComparisonService
 from .evidence_service import EvidenceService
 from .intent_service import IntentService
 from .payment_simulator import PaymentSimulator
+from .pending_decision_service import PendingDecisionService
 from .policy_service import PolicyService
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ class AuthorizationService:
         audit_service: AuditService,
         payment_simulator: PaymentSimulator,
         session_store: SessionStoreAdapter,
+        pending_decision_svc: PendingDecisionService,
     ) -> None:
         self._intent_svc = intent_service
         self._evidence_svc = evidence_service
@@ -57,6 +59,7 @@ class AuthorizationService:
         self._audit_svc = audit_service
         self._simulator = payment_simulator
         self._session_store = session_store
+        self._pending_svc = pending_decision_svc
 
     async def evaluate(
         self,
@@ -141,7 +144,22 @@ class AuthorizationService:
             },
         )
 
-        # Step 6: Execute mock payment ONLY if ALLOW
+        # Step 6: Persist pending decision when REQUIRE_HUMAN_APPROVAL
+        # This must happen BEFORE the audit event so the record exists for /approve.
+        if decision == Decision.REQUIRE_HUMAN_APPROVAL:
+            await self._pending_svc.create_pending_decision(
+                decision_id=decision_id,
+                user_id=user.user_id,
+                session_id=session_id,
+                intent=intent,
+                signals=signals,
+                policy_result=policy_result,
+                evidence_id=evidence.evidence_id if evidence else None,
+                created_at=decided_at,
+                expires_at=expires_at,
+            )
+
+        # Step 7: Execute mock payment ONLY if ALLOW
         payment_result: Optional[MockPaymentResult] = None
         if decision == Decision.ALLOW:
             payment_result = await self._simulator.simulate(
@@ -151,8 +169,8 @@ class AuthorizationService:
             # Record payee in history after successful authorization
             await self._session_store.record_payee(user.user_id, intent.payee)
 
-        # Step 7: Write tamper-evident audit event BEFORE returning response
-        audit_event = await self._audit_svc.record(
+        # Step 8: Write tamper-evident audit event BEFORE returning response
+        await self._audit_svc.record(
             event_type=AuditEventType.AUTHORIZATION_DECISION,
             user_id=user.user_id,
             session_id=session_id,
@@ -169,7 +187,23 @@ class AuthorizationService:
             ),
         )
 
-        # Step 8: Build and return AuthorizationDecision
+        # Also write a dedicated HUMAN_APPROVAL_REQUESTED event for REQUIRE_HUMAN_APPROVAL.
+        # This provides a clear, queryable audit record that human review was triggered.
+        if decision == Decision.REQUIRE_HUMAN_APPROVAL:
+            await self._audit_svc.record(
+                event_type=AuditEventType.HUMAN_APPROVAL_REQUESTED,
+                user_id=user.user_id,
+                session_id=session_id,
+                intent_id=intent.intent_id,
+                evidence_id=evidence.evidence_id if evidence else None,
+                decision_id=decision_id,
+                decision=decision.value,
+                intent_snapshot=intent.model_dump(mode="json"),
+                signals_snapshot=signals.model_dump(mode="json"),
+                policy_snapshot=policy_result.model_dump(mode="json"),
+            )
+
+        # Step 9: Build and return AuthorizationDecision
         return AuthorizationDecision(
             decision_id=decision_id,
             intent_id=intent.intent_id,

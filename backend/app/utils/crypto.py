@@ -107,3 +107,43 @@ def verify_chain(
                 )
 
     return (len(errors) == 0, errors)
+
+
+def compute_transaction_binding_hash(
+    intent_id: str,
+    payee: str,
+    amount: float,
+    currency: str,
+    evidence_id: str | None,
+) -> str:
+    """
+    Produce a deterministic, tamper-evident hash that binds a human approval
+    to the EXACT transaction represented in the pending decision.
+
+    Canonical form:
+      {
+        "amount":      "<amount rounded to 2dp as string>",
+        "currency":    "<UPPER>",
+        "evidence_id": "<evidence_id or empty string>",
+        "intent_id":   "<intent_id>",
+        "payee":       "<payee stripped and lower-cased>",
+      }
+
+    Keys are sorted by canonical_json (sort_keys=True).
+    Amount is serialised as a fixed-precision string to avoid float drift.
+    Payee is normalised (strip + lower) to prevent trivial bypass via
+    trailing spaces or case variations.
+
+    SECURITY: This hash is recomputed at approval time from the STORED
+    immutable snapshot. Any change to payee, amount, currency, intent, or
+    evidence causes a mismatch and the approval is rejected.
+    """
+    canonical = {
+        "amount":      str(round(amount, 2)),
+        "currency":    currency.upper(),
+        "evidence_id": evidence_id or "",
+        "intent_id":   intent_id,
+        "payee":       payee.strip().lower(),
+    }
+    return sha256_hex(canonical_json(canonical))
+

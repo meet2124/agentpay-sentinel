@@ -408,3 +408,215 @@ async def test_evidence_put_is_idempotent(evidence_adapter):
     assert result is not None
     assert result["vendor_name"] == "v2"
     assert abs(result["amount"] - 200.0) < 0.01
+
+
+# ---------------------------------------------------------------------------
+# Pending Decision Store Tests (FIX 2 — Atomic APPROVED → EXECUTED transition)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def pending_adapter():
+    with mock_aws():
+        ddb = boto3.resource("dynamodb", region_name=_REGION)
+        _create_sessions_table(ddb)
+        from app.adapters.dynamo import DynamoPendingDecisionStoreAdapter
+        yield DynamoPendingDecisionStoreAdapter(settings=_SessionsSettings())
+
+
+@pytest.mark.asyncio
+async def test_dynamo_pending_put_and_get(pending_adapter):
+    """put_pending_decision + get_pending_decision must roundtrip correctly."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "PENDING",
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+    retrieved = await pending_adapter.get_pending_decision(decision_id)
+
+    assert retrieved is not None
+    assert retrieved["decision_id"] == decision_id
+    assert retrieved["status"] == "PENDING"
+    assert retrieved["user_id"] == "usr_standard"
+    # DynamoDB internal keys must be stripped
+    assert "pk" not in retrieved
+    assert "sk" not in retrieved
+
+
+@pytest.mark.asyncio
+async def test_dynamo_pending_update_pending_to_approved(pending_adapter):
+    """update_pending_decision must atomically transition PENDING → APPROVED."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "PENDING",
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+    await pending_adapter.update_pending_decision(
+        decision_id,
+        {"status": "APPROVED", "approved_at": "2026-09-18T00:30:00+00:00"},
+    )
+
+    retrieved = await pending_adapter.get_pending_decision(decision_id)
+    assert retrieved is not None
+    assert retrieved["status"] == "APPROVED"
+    assert retrieved["approved_at"] == "2026-09-18T00:30:00+00:00"
+
+
+@pytest.mark.asyncio
+async def test_dynamo_update_rejects_non_pending(pending_adapter):
+    """update_pending_decision must reject a record that is not PENDING (replay guard)."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "APPROVED",   # Already approved
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await pending_adapter.update_pending_decision(
+            decision_id, {"status": "DENIED"}
+        )
+
+    assert "no longer PENDING" in str(exc_info.value) or "PENDING" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_dynamo_mark_executed_succeeds_when_approved(pending_adapter):
+    """mark_executed must atomically transition APPROVED → EXECUTED."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "APPROVED",
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+
+    executed_at = "2026-09-18T00:35:00+00:00"
+    await pending_adapter.mark_executed(decision_id, executed_at)
+
+    retrieved = await pending_adapter.get_pending_decision(decision_id)
+    assert retrieved is not None
+    assert retrieved["status"] == "EXECUTED"
+    assert retrieved["executed_at"] == executed_at
+
+
+@pytest.mark.asyncio
+async def test_dynamo_mark_executed_rejects_pending(pending_adapter):
+    """mark_executed must raise RuntimeError if the record is still PENDING."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "PENDING",
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await pending_adapter.mark_executed(decision_id, "2026-09-18T00:35:00+00:00")
+
+    assert "APPROVED" in str(exc_info.value) or "concurrent" in str(exc_info.value).lower()
+
+
+@pytest.mark.asyncio
+async def test_dynamo_mark_executed_concurrent_guard(pending_adapter):
+    """Second concurrent mark_executed must be rejected by the DynamoDB condition."""
+    decision_id = f"dec_{uuid.uuid4().hex[:8]}"
+    record = {
+        "decision_id": decision_id,
+        "status": "APPROVED",
+        "user_id": "usr_standard",
+        "session_id": "sess_test",
+        "intent_id": "intent_test",
+        "amount": 50000.0,
+        "currency": "INR",
+        "payee": "ABC Hardware",
+        "intent_snapshot": {},
+        "signals_snapshot": {},
+        "policy_snapshot": {},
+        "evidence_id": None,
+        "transaction_binding_hash": "sha256:dummy",
+        "created_at": "2026-09-18T00:00:00+00:00",
+        "expires_at": "2026-09-18T01:00:00+00:00",
+    }
+
+    await pending_adapter.put_pending_decision(record)
+
+    # First call succeeds
+    await pending_adapter.mark_executed(decision_id, "2026-09-18T00:35:00+00:00")
+
+    # Second call must fail — status is now EXECUTED, not APPROVED
+    with pytest.raises(RuntimeError) as exc_info:
+        await pending_adapter.mark_executed(decision_id, "2026-09-18T00:35:01+00:00")
+
+    error_msg = str(exc_info.value)
+    assert "APPROVED" in error_msg or "concurrent" in error_msg.lower() or "EXECUTED" in error_msg
+

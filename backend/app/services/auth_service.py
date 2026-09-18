@@ -59,6 +59,20 @@ class AuthService:
 
     async def validate_token(self, token: str) -> User:
         """Validate a bearer token and return the associated User."""
+        user, _session_id = await self.validate_token_with_session(token)
+        return user
+
+    async def validate_token_with_session(self, token: str) -> tuple[User, str]:
+        """
+        Validate a bearer token and return (User, session_id).
+
+        Used by the payment evaluation path to propagate the real session_id
+        instead of the previously hardcoded 'sess_api'.
+
+        session_id is always a non-empty string (created by create_session).
+        In the unlikely event the session record lacks a session_id key
+        (e.g. legacy records), we fall back to 'sess_unknown'.
+        """
         session = await self._store.get_session(token)
         if not session:
             raise HTTPException(
@@ -72,7 +86,8 @@ class AuthService:
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="User associated with token no longer exists.",
             )
-        return User(**user_data)
+        session_id = session.get("session_id") or "sess_unknown"
+        return User(**user_data), session_id
 
     async def get_user(self, user_id: str) -> User:
         """Fetch a user by ID directly (internal use)."""

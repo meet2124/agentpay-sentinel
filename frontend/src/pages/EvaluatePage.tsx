@@ -4,7 +4,7 @@ import {
   ChevronDown, ChevronUp, Loader2, Shield, ArrowRight,
 } from 'lucide-react'
 import { api } from '../services/api'
-import type { EvaluateResponse, Evidence } from '../types/api'
+import type { AuthorizationDecision, EvaluateResponse, Evidence } from '../types/api'
 import DecisionPanel, { type DecisionContext } from '../components/DecisionPanel'
 import SignalGrid from '../components/SignalGrid'
 import { formatDate, formatINR, RULE_META } from '../utils/format'
@@ -35,15 +35,15 @@ const SCENARIOS = [
   },
   {
     id: 'human_approval',
-    label: '🟡  Human Approval — Amount exceeds spending limit',
-    raw_input: 'Pay 1850 to ABC Hardware.',
+    label: '🟡  Human Approval — Large invoice exceeds spending limit',
+    raw_input: 'Pay 50000 to ABC Hardware.',
     evidence: {
-      vendor_name: 'ABC Hardware Co.', amount: 1850, currency: 'INR',
+      vendor_name: 'ABC Hardware Co.', amount: 50000, currency: 'INR',
       invoice_number: 'INV-042', invoice_date: '2026-09-15',
       extraction_confidence: 0.94, extraction_method: 'STUB',
     },
     tag: 'HUMAN',
-    note: '(Run as usr_basic with ₹1,000 limit)',
+    note: '(Standard user ₹50,000 limit exceeded → REQUIRE_HUMAN_APPROVAL)',
   },
   {
     id: 'small_payment',
@@ -78,6 +78,7 @@ export default function EvaluatePage() {
   const [showSignals, setShowSignals] = useState(false)
   const [showPolicy, setShowPolicy] = useState(false)
   const [decisionCtx, setDecisionCtx] = useState<DecisionContext | undefined>(undefined)
+  const [approvalLoading, setApprovalLoading] = useState<'approve' | 'deny' | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
 
   async function applyScenario(s: typeof SCENARIOS[0]) {
@@ -166,7 +167,45 @@ export default function EvaluatePage() {
     setResult(null); setError(null); setStep('idle')
     setRawInput(''); setEvidence(null); setEvidenceFile(null)
     setSelectedScenario(null); setShowSignals(false); setShowPolicy(false)
-    setDecisionCtx(undefined)
+    setDecisionCtx(undefined); setApprovalLoading(null)
+  }
+
+  async function handleApprove() {
+    if (!result || result.authorization.decision !== 'REQUIRE_HUMAN_APPROVAL') return
+    const decisionId = result.authorization.decision_id
+    setApprovalLoading('approve')
+    setError(null)
+    try {
+      const approved: AuthorizationDecision = await api.approvePayment(decisionId)
+      // Replace the current result with the final approved AuthorizationDecision
+      setResult({
+        authorization: approved,
+        audit_event_id: result.audit_event_id,
+      })
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setApprovalLoading(null)
+    }
+  }
+
+  async function handleDeny() {
+    if (!result || result.authorization.decision !== 'REQUIRE_HUMAN_APPROVAL') return
+    const decisionId = result.authorization.decision_id
+    setApprovalLoading('deny')
+    setError(null)
+    try {
+      const denied: AuthorizationDecision = await api.denyPayment(decisionId)
+      // Replace the current result with the final denied AuthorizationDecision
+      setResult({
+        authorization: denied,
+        audit_event_id: result.audit_event_id,
+      })
+    } catch (e: any) {
+      setError(e.message)
+    } finally {
+      setApprovalLoading(null)
+    }
   }
 
   const isLoading = step === 'uploading' || step === 'evaluating'
@@ -323,6 +362,110 @@ export default function EvaluatePage() {
           {result && (
             <>
               <DecisionPanel result={result} context={decisionCtx} />
+
+              {/* Human Approval action buttons */}
+              {result.authorization.decision === 'REQUIRE_HUMAN_APPROVAL' && (
+                <div style={{
+                  background: 'rgba(245,158,11,0.06)',
+                  border: '1px solid rgba(245,158,11,0.25)',
+                  borderRadius: 'var(--radius-xl)',
+                  padding: 'var(--sp-5)',
+                  display: 'flex',
+                  flexDirection: 'column',
+                  gap: 'var(--sp-4)',
+                  animationName: 'fadeIn',
+                  animationDuration: '0.3s',
+                }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 'var(--sp-2)' }}>
+                    <AlertTriangle size={15} color="var(--human)" />
+                    <span style={{ fontWeight: 700, color: 'var(--human)', fontSize: 'var(--text-sm)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>Human Review Required</span>
+                  </div>
+
+                  {/* Transaction details */}
+                  <div style={{
+                    background: 'var(--bg-surface)',
+                    border: '1px solid var(--border-default)',
+                    borderRadius: 'var(--radius-lg)',
+                    padding: 'var(--sp-4)',
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 1fr',
+                    gap: 'var(--sp-3)',
+                    fontSize: 'var(--text-sm)',
+                  }}>
+                    <div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Payee</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--text-primary)' }}>
+                        {decisionCtx?.evidencePayee ?? decisionCtx?.intentPayee ?? result.authorization.signals.intent_id}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Amount</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontWeight: 700, color: 'var(--human)' }}>
+                        {decisionCtx?.intentAmount != null ? `₹${decisionCtx.intentAmount.toLocaleString('en-IN')}` : '—'}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Decision ID</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-secondary)', wordBreak: 'break-all' }}>
+                        {result.authorization.decision_id}
+                      </div>
+                    </div>
+                    <div>
+                      <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em', marginBottom: 4 }}>Expires At</div>
+                      <div style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-secondary)' }}>
+                        {formatDate(result.authorization.expires_at)}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* APPROVE / DENY buttons */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 'var(--sp-3)' }}>
+                    <button
+                      id="btn-human-approve"
+                      className="btn btn-primary"
+                      style={{
+                        background: 'var(--allow)',
+                        borderColor: 'var(--allow)',
+                        boxShadow: '0 0 0 0 var(--allow)',
+                        fontWeight: 700,
+                        letterSpacing: '0.05em',
+                        gap: 'var(--sp-2)',
+                      }}
+                      onClick={handleApprove}
+                      disabled={approvalLoading !== null}
+                    >
+                      {approvalLoading === 'approve' ? (
+                        <><Loader2 size={16} style={{ animation: 'spin 0.7s linear infinite' }} />Approving…</>
+                      ) : (
+                        <><CheckCircle2 size={16} />✓ APPROVE</>
+                      )}
+                    </button>
+                    <button
+                      id="btn-human-deny"
+                      className="btn btn-secondary"
+                      style={{
+                        background: 'rgba(239,68,68,0.12)',
+                        borderColor: 'rgba(239,68,68,0.4)',
+                        color: 'var(--deny)',
+                        fontWeight: 700,
+                        letterSpacing: '0.05em',
+                        gap: 'var(--sp-2)',
+                      }}
+                      onClick={handleDeny}
+                      disabled={approvalLoading !== null}
+                    >
+                      {approvalLoading === 'deny' ? (
+                        <><Loader2 size={16} style={{ animation: 'spin 0.7s linear infinite' }} />Denying…</>
+                      ) : (
+                        <><XCircle size={16} />✕ DENY</>
+                      )}
+                    </button>
+                  </div>
+                  <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-tertiary)', textAlign: 'center', lineHeight: 1.5 }}>
+                    Your decision is cryptographically bound to this exact transaction. No payment change is possible post-approval.
+                  </div>
+                </div>
+              )}
 
               {/* Signals expandable */}
               <div className="card">

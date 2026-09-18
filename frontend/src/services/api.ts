@@ -13,6 +13,7 @@ import type {
   AuditListResponse,
   ChainVerifyResponse,
   PolicyListResponse,
+  AuthorizationDecision,
   ApiError,
 } from '../types/api';
 
@@ -102,6 +103,20 @@ class SentinelApiClient {
     // SECURITY: frontend never decides authorization.
     // All signals, policy evaluation, and decision come from backend.
     const r = await this.http.post<EvaluateResponse>('/payments/evaluate', body);
+    return r.data;
+  }
+
+  async approvePayment(decisionId: string): Promise<AuthorizationDecision> {
+    // Human approves a REQUIRE_HUMAN_APPROVAL decision.
+    // Backend enforces ownership, expiry, binding hash, and replay protection.
+    const r = await this.http.post<AuthorizationDecision>(`/payments/${decisionId}/approve`, {});
+    return r.data;
+  }
+
+  async denyPayment(decisionId: string): Promise<AuthorizationDecision> {
+    // Human explicitly denies a REQUIRE_HUMAN_APPROVAL decision.
+    // No payment is ever executed on denial.
+    const r = await this.http.post<AuthorizationDecision>(`/payments/${decisionId}/deny`, {});
     return r.data;
   }
 

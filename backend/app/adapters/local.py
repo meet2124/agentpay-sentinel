@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from .base import AuditStoreAdapter, EvidenceStoreAdapter, LLMAdapter, SessionStoreAdapter, StorageAdapter
+from .base import AuditStoreAdapter, EvidenceStoreAdapter, LLMAdapter, PendingDecisionStoreAdapter, SessionStoreAdapter, StorageAdapter
 from ..utils.crypto import GENESIS_HASH
 
 
@@ -76,6 +76,7 @@ _payee_history: dict[str, list[str]] = {}  # user_id → [payee names]
 _audit_store: dict[str, dict] = {}     # event_id → event dict
 _audit_order: dict[str, list[str]] = {}  # user_id → [event_ids in order]
 _evidence_store: dict[str, dict] = {}  # evidence_id → serialised Evidence dict
+_pending_decisions: dict[str, dict] = {}  # decision_id → pending decision record
 
 
 # ---------------------------------------------------------------------------
@@ -214,6 +215,73 @@ class LocalEvidenceStoreAdapter(EvidenceStoreAdapter):
     async def get_evidence(self, evidence_id: str) -> dict | None:
         ev = _evidence_store.get(evidence_id)
         return copy.deepcopy(ev) if ev else None
+
+
+# ---------------------------------------------------------------------------
+# Pending Decision Store Adapter — Local
+# ---------------------------------------------------------------------------
+
+class LocalPendingDecisionStoreAdapter(PendingDecisionStoreAdapter):
+    """
+    In-memory pending decision store for local development and unit tests.
+    Backed by a module-level dict — process lifetime only.
+
+    Replay protection: update_pending_decision checks that the existing record
+    status is still PENDING before applying updates; raises RuntimeError otherwise.
+    """
+
+    async def put_pending_decision(self, record: dict) -> None:
+        decision_id = record["decision_id"]
+        _pending_decisions[decision_id] = copy.deepcopy(record)
+
+    async def get_pending_decision(self, decision_id: str) -> dict | None:
+        rec = _pending_decisions.get(decision_id)
+        return copy.deepcopy(rec) if rec else None
+
+    async def update_pending_decision(
+        self, decision_id: str, updates: dict
+    ) -> None:
+        """
+        Apply updates to a pending decision.
+        REPLAY PROTECTION: raises RuntimeError if the record is no longer PENDING
+        (i.e. it has already been approved, denied, or executed).
+        """
+        rec = _pending_decisions.get(decision_id)
+        if rec is None:
+            raise RuntimeError(
+                f"Pending decision {decision_id} not found."
+            )
+        # Guard against concurrent / replayed approvals
+        if rec.get("status") != "PENDING":
+            raise RuntimeError(
+                f"Pending decision {decision_id} is no longer PENDING "
+                f"(current status: {rec.get('status')}). "
+                "Approval replay rejected."
+            )
+        _pending_decisions[decision_id] = {**rec, **copy.deepcopy(updates)}
+
+    async def mark_executed(self, decision_id: str, executed_at: str) -> None:
+        """
+        Atomically transition APPROVED → EXECUTED.
+        Raises RuntimeError if the record is not in APPROVED state or not found.
+        This mirrors the DynamoDB atomic conditional update behaviour for tests.
+        """
+        rec = _pending_decisions.get(decision_id)
+        if rec is None:
+            raise RuntimeError(
+                f"Pending decision {decision_id} not found."
+            )
+        if rec.get("status") != "APPROVED":
+            raise RuntimeError(
+                f"Pending decision {decision_id} is not APPROVED "
+                f"(current status: {rec.get('status')}). "
+                "Cannot mark as EXECUTED — concurrent execution guard rejected."
+            )
+        _pending_decisions[decision_id] = {
+            **rec,
+            "status": "EXECUTED",
+            "executed_at": executed_at,
+        }
 
 
 # ---------------------------------------------------------------------------

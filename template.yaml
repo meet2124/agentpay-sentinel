@@ -178,7 +178,9 @@ Resources:
                   - !GetAtt AuditTable.Arn
                   - !Sub "${AuditTable.Arn}/index/*"
 
-        # DynamoDB — GetItem + PutItem + Query on sentinel-sessions
+        # DynamoDB — GetItem + PutItem + Query + UpdateItem on sentinel-sessions
+        # UpdateItem is required for atomic pending decision status transitions
+        # (replay protection uses ConditionExpression with UpdateItem).
         - PolicyName: DynamoDBSessionsAccess
           PolicyDocument:
             Version: "2012-10-17"
@@ -188,9 +190,11 @@ Resources:
                   - dynamodb:GetItem
                   - dynamodb:PutItem
                   - dynamodb:Query
+                  - dynamodb:UpdateItem
                 Resource:
                   - !GetAtt SessionsTable.Arn
                   - !Sub "${SessionsTable.Arn}/index/*"
+
 
         # Bedrock — Converse API (IAM action: bedrock:InvokeModel)
         # The Lambda calls Converse with modelId set to the APAC cross-region
