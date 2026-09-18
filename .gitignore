@@ -21,3 +21,5 @@ frontend/.vite/
 # OS
 .DS_Store
 Thumbs.db
+# AWS SAM build artifacts
+.aws-sam/
