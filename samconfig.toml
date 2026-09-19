@@ -26,5 +26,6 @@ resolve_s3 = true
 # s3_prefix is used for SAM build artifacts — not the evidence bucket.
 s3_prefix = "AgentPay-Sentinel"
 stack_name = "AgentPay-Sentinel"
-parameter_overrides = "Environment=\"production\" AllowedOrigins=\"http://localhost:5173\""
+parameter_overrides = "Environment=\"production\" AllowedOrigins=\"https://main.d2qhw74txgs7ha.amplifyapp.com\""
 image_repositories = []
+
