@@ -124,6 +124,17 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    class CORSDebugMiddleware:
+        def __init__(self, app):
+            self.app = app
+        async def __call__(self, scope, receive, send):
+            if scope["type"] == "http":
+                headers = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope.get("headers", [])}
+                logger.info(f"[CORS_DEBUG] {scope.get('method')} {scope.get('path')} | Headers: {json.dumps(headers)}")
+            await self.app(scope, receive, send)
+    
+    app.add_middleware(CORSDebugMiddleware)
+
     # --- Exception handlers (never expose stack traces to clients) ---
 
     @app.exception_handler(HTTPException)
