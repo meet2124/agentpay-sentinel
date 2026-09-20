@@ -17,7 +17,7 @@ import type {
   ApiError,
 } from '../types/api';
 
-const BASE_URL = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
+const BASE_URL = import.meta.env.VITE_API_BASE_URL || (import.meta.env.PROD ? 'https://ji7x942vif.execute-api.ap-south-1.amazonaws.com' : 'http://localhost:8000');
 
 class SentinelApiClient {
   private http: AxiosInstance;
