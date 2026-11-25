@@ -231,4 +231,6 @@ Frontend: http://localhost:5173
 
 ## License
 
+Off campus code :- NK6UR3
+
 MIT — see LICENSE file.
